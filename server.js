@@ -15,7 +15,8 @@ const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
 const PORT = process.env.PORT || 3000;
 
 // ---- Database setup (sql.js) ----
-const DB_PATH = '/opt/render/project/data/chat.db';
+// Use local file (no disk required) – data lost on restart, but works
+const DB_PATH = './chat.db';
 let db;
 
 function saveDb() {
@@ -57,6 +58,7 @@ async function initDatabase() {
     const fileBuffer = fs.readFileSync(DB_PATH);
     db = new SQL.Database(fileBuffer);
   } catch (e) {
+    // No existing file, start fresh
     db = new SQL.Database();
   }
   db.run('PRAGMA foreign_keys = ON');
