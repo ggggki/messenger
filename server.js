@@ -3,60 +3,111 @@ const http = require('http');
 const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const Database = require('better-sqlite3');
+const initSqlJs = require('sql.js');
+const fs = require('fs');
 const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-// Persistent database on Render’s mounted disk
-const db = new Database('/opt/render/project/data/chat.db');
-db.pragma('journal_mode = WAL');
-
-// Create tables if they don’t exist
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS contacts (
-    user_id INTEGER,
-    contact_id INTEGER,
-    PRIMARY KEY(user_id, contact_id)
-  );
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sender INTEGER NOT NULL,
-    receiver INTEGER NOT NULL,
-    text TEXT NOT NULL,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
-
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
 const PORT = process.env.PORT || 3000;
 
-// Serve static files (our frontend)
+// ---- Database setup (sql.js) ----
+const DB_PATH = '/opt/render/project/data/chat.db';
+let db;
+
+function saveDb() {
+  const data = db.export();
+  const buffer = Buffer.from(data);
+  fs.writeFileSync(DB_PATH, buffer);
+}
+
+function createTables() {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS contacts (
+      user_id INTEGER,
+      contact_id INTEGER,
+      PRIMARY KEY(user_id, contact_id)
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sender INTEGER NOT NULL,
+      receiver INTEGER NOT NULL,
+      text TEXT NOT NULL,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  saveDb();
+}
+
+async function initDatabase() {
+  const SQL = await initSqlJs();
+  try {
+    const fileBuffer = fs.readFileSync(DB_PATH);
+    db = new SQL.Database(fileBuffer);
+  } catch (e) {
+    db = new SQL.Database();
+  }
+  db.run('PRAGMA foreign_keys = ON');
+  createTables();
+}
+
+function runAndSave(sql, params = []) {
+  db.run(sql, params);
+  saveDb();
+}
+
+function queryAll(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject());
+  }
+  stmt.free();
+  return rows;
+}
+
+function queryOne(sql, params = []) {
+  const rows = queryAll(sql, params);
+  return rows.length ? rows[0] : null;
+}
+
+// ---- Express routes ----
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-// ---------- REST API ----------
 app.post('/signup', (req, res) => {
   const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
   const hash = bcrypt.hashSync(password, 10);
   try {
-    db.prepare('INSERT INTO users (username, password) VALUES (?, ?)').run(username, hash);
+    runAndSave('INSERT INTO users (username, password) VALUES (?, ?)', [username, hash]);
     res.json({ success: true });
   } catch (e) {
-    res.status(400).json({ error: 'Username taken' });
+    if (e.message && e.message.includes('UNIQUE')) {
+      return res.status(400).json({ error: 'Username taken' });
+    }
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
 app.post('/login', (req, res) => {
   const { username, password } = req.body;
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
+  const user = queryOne('SELECT * FROM users WHERE username = ?', [username]);
   if (!user || !bcrypt.compareSync(password, user.password))
     return res.status(401).json({ error: 'Invalid credentials' });
   const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
@@ -67,11 +118,11 @@ app.get('/contacts', (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   try {
     const { id } = jwt.verify(token, JWT_SECRET);
-    const contacts = db.prepare(`
+    const contacts = queryAll(`
       SELECT u.id, u.username FROM contacts c
       JOIN users u ON u.id = c.contact_id
       WHERE c.user_id = ?
-    `).all(id);
+    `, [id]);
     res.json(contacts);
   } catch { res.status(401).json({ error: 'Unauthorized' }); }
 });
@@ -81,9 +132,9 @@ app.post('/add-contact', (req, res) => {
   try {
     const { id } = jwt.verify(token, JWT_SECRET);
     const { contactUsername } = req.body;
-    const contact = db.prepare('SELECT id FROM users WHERE username = ?').get(contactUsername);
+    const contact = queryOne('SELECT id FROM users WHERE username = ?', [contactUsername]);
     if (!contact) return res.status(404).json({ error: 'User not found' });
-    db.prepare('INSERT OR IGNORE INTO contacts (user_id, contact_id) VALUES (?, ?)').run(id, contact.id);
+    runAndSave('INSERT OR IGNORE INTO contacts (user_id, contact_id) VALUES (?, ?)', [id, contact.id]);
     res.json({ success: true, contactId: contact.id });
   } catch { res.status(401).json({ error: 'Unauthorized' }); }
 });
@@ -92,45 +143,46 @@ app.get('/messages/:contactId', (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   try {
     const { id } = jwt.verify(token, JWT_SECRET);
-    const msgs = db.prepare(`
+    const msgs = queryAll(`
       SELECT * FROM messages
       WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
       ORDER BY timestamp
-    `).all(id, req.params.contactId, req.params.contactId, id);
+    `, [id, req.params.contactId, req.params.contactId, id]);
     res.json(msgs);
   } catch { res.status(401).json({ error: 'Unauthorized' }); }
 });
 
-// ---------- Socket.io real‑time messaging ----------
+// ---- Socket.io real‑time ----
 io.on('connection', (socket) => {
-  console.log('User connected');
   socket.on('join', (token) => {
     try {
       const user = jwt.verify(token, JWT_SECRET);
       socket.userId = user.id;
       socket.username = user.username;
-      socket.join(`user_${user.id}`);   // private room for this user
+      socket.join(`user_${user.id}`);
     } catch { socket.disconnect(); }
   });
 
   socket.on('private message', ({ to, text }) => {
     if (!socket.userId) return;
-    const info = db.prepare('INSERT INTO messages (sender, receiver, text) VALUES (?, ?, ?)').run(socket.userId, to, text);
+    runAndSave('INSERT INTO messages (sender, receiver, text) VALUES (?, ?, ?)', [socket.userId, to, text]);
+    const msg = queryOne('SELECT * FROM messages WHERE id = last_insert_rowid()');
     const payload = {
-      id: info.lastInsertRowid,
+      id: msg.id,
       sender: socket.userId,
       senderName: socket.username,
       text,
       timestamp: new Date().toISOString()
     };
-    // Send to receiver and also back to sender (so it appears in their chat)
     io.to(`user_${to}`).emit('private message', payload);
     socket.emit('private message', payload);
   });
-
-  socket.on('disconnect', () => {
-    console.log('User disconnected');
-  });
 });
 
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// ---- Start server after database is ready ----
+initDatabase().then(() => {
+  server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+}).catch(err => {
+  console.error('Failed to initialize database:', err);
+  process.exit(1);
+});
